@@ -6,7 +6,6 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -111,7 +110,7 @@ func (c *b2Client) Download(ctx context.Context, bucket, fileName string, offset
 	if (offset <= 0 && res.StatusCode != 200) || (offset > 0 && res.StatusCode != 206) {
 		err = errorResponse(res)
 		res.Body.Close()
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.Download(ctx, bucket, fileName, offset)
@@ -160,7 +159,7 @@ func (c *b2Client) GetUploadURL(ctx context.Context, bucket string) (*uploadURLI
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.GetUploadURL(ctx, bucket)
@@ -295,7 +294,7 @@ func (c *b2Client) startLargeFile(ctx context.Context, bucket, fileName string) 
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.startLargeFile(ctx, bucket, fileName)
@@ -352,7 +351,7 @@ func (c *b2Client) copyPart(ctx context.Context, sourceFileID, largeFileID strin
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.copyPart(ctx, sourceFileID, largeFileID, partNumber, copyRange)
@@ -409,7 +408,7 @@ func (c *b2Client) getUploadPartURL(ctx context.Context, fileID string) (*upload
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.getUploadPartURL(ctx, fileID)
@@ -458,7 +457,7 @@ func (c *b2Client) cancelLargeFile(ctx context.Context, fileID string) error {
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.cancelLargeFile(ctx, fileID)
@@ -503,7 +502,7 @@ func (c *b2Client) finishLargeFile(ctx context.Context, fileID string, partSha1A
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			c.auth = nil
 			return c.finishLargeFile(ctx, fileID, partSha1Array)
@@ -512,6 +511,101 @@ func (c *b2Client) finishLargeFile(ctx context.Context, fileID string, partSha1A
 	}
 
 	return nil
+}
+
+type b2File struct {
+	Action          string `json:"action"`
+	ContentLength   int64  `json:"contentLength"`
+	FileName        string `json:"fileName"`
+	UploadTimestamp int64  `json:"uploadTimestamp"`
+}
+
+type listFileNamesResponse struct {
+	Files        []b2File `json:"files"`
+	NextFileName *string  `json:"nextFileName"`
+}
+
+func (c *b2Client) ListFileNames(ctx context.Context, bucket, prefix, delimiter string, getAll bool) ([]b2File, error) {
+	if !getAll {
+		res, err := c.listFileNamesWithStartFileName(ctx, bucket, nil, 100, prefix, delimiter)
+		if err != nil {
+			return nil, err
+		}
+		return res.Files, nil
+	}
+
+	var files []b2File
+	var startFileName *string
+
+	for {
+		res, err := c.listFileNamesWithStartFileName(ctx, bucket, startFileName, 10000, prefix, delimiter)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, res.Files...)
+		startFileName = res.NextFileName
+
+		if startFileName == nil {
+			return files, nil
+		}
+	}
+}
+
+func (c *b2Client) listFileNamesWithStartFileName(ctx context.Context, bucket string, startFileName *string, maxFileCount uint16, prefix, delimiter string) (*listFileNamesResponse, error) {
+	err := c.authorizeIfNeeded(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var reqBody struct {
+		bucketID      string  `json:"bucketId"`
+		startFileName *string `json:"startFileName"`
+		maxFileCount  uint16  `json:"maxFileCount"`
+		prefix        string  `json:"prefix"`
+		delimiter     string  `json:"delimiter"`
+	}
+	reqBody.bucketID = bucket
+	reqBody.startFileName = startFileName
+	reqBody.maxFileCount = maxFileCount
+	reqBody.prefix = prefix
+	reqBody.delimiter = delimiter
+	reqBodyBytes, err := json.Marshal(&reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", c.auth.apiURL+"/b2api/v2/b2_list_file_names", bytes.NewBuffer(reqBodyBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	req = req.WithContext(ctx)
+	req.Header.Set("Authorization", c.auth.authorizationToken)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	res, err := c.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		err = errorResponse(res)
+		if isBadToken(err) {
+			// retry
+			c.auth = nil
+			return c.listFileNamesWithStartFileName(ctx, bucket, startFileName, maxFileCount, prefix, delimiter)
+		}
+		return nil, err
+	}
+
+	var d listFileNamesResponse
+	err = json.NewDecoder(res.Body).Decode(&d)
+	if err != nil {
+		return nil, err
+	}
+
+	return &d, nil
 }
 
 func escapeBucket(bucket string) string {
@@ -526,8 +620,33 @@ func escapeFileName(fileName string) string {
 	return strings.Join(split, "/")
 }
 
-var errBadToken = errors.New("bad authorization token")
-var errNotFound = errors.New("file not found")
+type b2Error struct {
+	RawResponse string
+	Status      int    `json:"status"`
+	Code        string `json:"code"`
+	Message     string `json:"message"`
+}
+
+func (e *b2Error) Error() string {
+	if len(e.Message) > 0 {
+		return e.Message
+	}
+	return e.RawResponse
+}
+
+func isBadToken(err error) bool {
+	if be, ok := err.(*b2Error); ok {
+		return be.Code == "bad_auth_token" || be.Code == "expired_auth_token"
+	}
+	return false
+}
+
+func isNotFound(err error) bool {
+	if be, ok := err.(*b2Error); ok {
+		return be.Code == "not_found"
+	}
+	return false
+}
 
 func errorResponse(res *http.Response) error {
 	var buf bytes.Buffer
@@ -535,17 +654,12 @@ func errorResponse(res *http.Response) error {
 	resBytes := buf.Bytes()
 
 	// https://www.backblaze.com/b2/docs/calling.html#error_handling
-	var errorData struct {
-		code string `json:"code"`
-	}
-	json.Unmarshal(resBytes, &errorData)
+	var errorData b2Error
+	err := json.Unmarshal(resBytes, &errorData)
 
-	if errorData.code == "bad_auth_token" || errorData.code == "expired_auth_token" {
-		return errBadToken
-	}
-
-	if errorData.code == "not_found" {
-		return errNotFound
+	if err == nil {
+		errorData.RawResponse = string(resBytes)
+		return &errorData
 	}
 
 	return fmt.Errorf("%d %s: %s", res.StatusCode, res.Status, resBytes)
@@ -678,7 +792,7 @@ func (w *LargeFileWriter) uploadChunk(p []byte) error {
 
 	if res.StatusCode != 200 {
 		err = errorResponse(res)
-		if err == errBadToken {
+		if isBadToken(err) {
 			// retry
 			w.uploadPartURL = nil
 			return w.uploadChunk(p)

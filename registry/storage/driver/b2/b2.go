@@ -155,7 +155,7 @@ func (d *driver) b2Path(path string) string {
 }
 
 func convertError(err error, path string) error {
-	if err == errNotFound {
+	if isNotFound(err) {
 		return storagedriver.PathNotFoundError{
 			Path:       path,
 			DriverName: driverName,
